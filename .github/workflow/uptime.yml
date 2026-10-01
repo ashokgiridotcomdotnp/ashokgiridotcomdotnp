@@ -1,0 +1,126 @@
+name: Keep Render Apps Awake
+
+on:
+  schedule:
+    # Hourly on purpose: GitHub throttles high-frequency crons (*/5 only ran
+    # a few times a day). Each run loops internally every 5 minutes for ~50
+    # minutes and re-checks the Nepal-time windows on every round.
+    - cron: '0 * * * *'
+  workflow_dispatch:   # lets you trigger a test run manually from the Actions tab
+    inputs:
+      minutes:
+        description: 'How long to keep pinging (minutes)'
+        required: false
+        default: '50'
+
+permissions:
+  contents: read
+
+jobs:
+  ping-apps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: Ping apps in their active windows (Nepal time)
+        shell: python
+        env:
+          # Manual runs can shorten this (e.g. minutes=5) for a quick test.
+          PING_MINUTES: ${{ inputs.minutes || '50' }}
+          PING_INTERVAL_SECONDS: '300'
+        run: |
+          import datetime
+          import os
+          import time
+          import urllib.request
+          import urllib.error
+
+          # All times below are Nepal time (UTC+5:45).
+          # weekday(): Mon=0, Tue=1, Wed=2, Thu=3, Fri=4, Sat=5, Sun=6
+
+          def poemcapsule_active(now):
+              # Awake all the time EXCEPT two "closed" nights:
+              #   Friday 19:00 -> Saturday 07:00
+              #   Saturday 19:00 -> Sunday 07:00
+              wd = now.weekday()
+              minutes = now.hour * 60 + now.minute
+              closed_evening = wd in (4, 5) and minutes >= 19 * 60   # Fri/Sat after 7pm
+              closed_morning = wd in (5, 6) and minutes < 7 * 60     # Sat/Sun before 7am
+              return not (closed_evening or closed_morning)
+
+          def sautaboy_active(now):
+              # Office hours only: 09:45 -> 18:00, every day.
+              minutes = now.hour * 60 + now.minute
+              return (9 * 60 + 45) <= minutes < (18 * 60)
+
+          APPS = [
+              {
+                  "name": "poemcapsule",
+                  "url": "https://poemcapsule.onrender.com/",
+                  "is_active": poemcapsule_active,
+                  "window": "always, except Fri/Sat 19:00-07:00",
+              },
+              {
+                  "name": "sautaboy",
+                  "url": "https://sautaboy.com/",
+                  "is_active": sautaboy_active,
+                  "window": "09:45-18:00 daily",
+              },
+          ]
+
+          INTERVAL_SECONDS = int(os.environ.get("PING_INTERVAL_SECONDS") or 300)
+          DURATION_SECONDS = int(os.environ.get("PING_MINUTES") or 50) * 60
+
+          def nepal_now():
+              # Recomputed every round so windows flip correctly mid-run.
+              utc_now = datetime.datetime.now(datetime.timezone.utc)
+              return utc_now + datetime.timedelta(hours=5, minutes=45)
+
+          def ping(name, url):
+              req = urllib.request.Request(
+                  url,
+                  method="GET",
+                  headers={"User-Agent": "Mozilla/5.0 (compatible; render-keepalive-bot)"},
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as resp:
+                      print(f"  [OK]   {name} -> HTTP {resp.status}")
+                      return True
+              except urllib.error.HTTPError as e:
+                  # Server answered (even with an error status), so the app is awake
+                  print(f"  [OK]   {name} -> HTTP {e.code} (app responded)")
+                  return True
+              except Exception as e:
+                  print(f"  [FAIL] {name} -> {type(e).__name__}: {e}")
+                  return False
+
+          deadline = time.monotonic() + DURATION_SECONDS
+          round_no = 0
+          ok = 0
+          attempted = 0
+
+          while True:
+              round_no += 1
+              now = nepal_now()
+              print(f"[round {round_no}] Nepal time: {now:%a %Y-%m-%d %H:%M:%S}")
+              for app in APPS:
+                  if app["is_active"](now):
+                      print(f"  Pinging {app['name']} ({app['window']})...")
+                      attempted += 1
+                      if ping(app["name"], app["url"]):
+                          ok += 1
+                  else:
+                      print(f"  Skipping {app['name']} (outside window: {app['window']}).")
+              remaining = deadline - time.monotonic()
+              if remaining <= 0:
+                  break
+              time.sleep(min(INTERVAL_SECONDS, remaining))
+
+          print("-" * 60)
+          print(f"Done: {ok}/{attempted} successful ping(s) over {round_no} round(s).")
+          with open(os.environ.get("GITHUB_STEP_SUMMARY", os.devnull), "a") as f:
+              f.write(f"Keepalive run: {ok}/{attempted} successful ping(s) over {round_no} round(s).\n")
